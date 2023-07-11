@@ -2564,9 +2564,6 @@ where
         }
 
         self.dlc_channel_manager
-            .process_watched_txs(confirmed_txs)?;
-
-        self.dlc_channel_manager
             .get_store()
             .persist_chain_monitor(&chain_monitor)?;
 

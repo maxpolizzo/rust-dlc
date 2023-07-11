@@ -2226,9 +2226,11 @@ where
     }
 
     fn check_for_watched_tx(&self) -> Result<(), Error> {
-        let confirmed_txs = self.chain_monitor.lock().unwrap().confirmed_txs();
+        let chain_monitor = self.chain_monitor.lock().unwrap();
 
-        self.process_watched_txs(confirmed_txs)?;
+        self.process_watched_txs(chain_monitor.confirmed_txs())?;
+
+        self.get_store().persist_chain_monitor(&chain_monitor)?;
 
         Ok(())
     }

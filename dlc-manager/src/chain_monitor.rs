@@ -17,13 +17,13 @@ use crate::ChannelId;
 /// and some associated information used to apply an action when the id is seen.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ChainMonitor {
-    pub(crate) watched_tx: HashMap<Txid, ChannelInfo>,
+    pub(crate) watched_tx: HashMap<Txid, WatchState>,
     pub(crate) last_height: u64,
 }
 
 impl_dlc_writeable!(ChainMonitor, { (watched_tx, { cb_writeable, write_hash_map, read_hash_map}), (last_height, writeable) });
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChannelInfo {
     pub channel_id: ChannelId,
     pub tx_type: TxType,
@@ -31,7 +31,7 @@ pub(crate) struct ChannelInfo {
 
 impl_dlc_writeable!(ChannelInfo, { (channel_id, writeable), (tx_type, writeable) });
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TxType {
     Revoked {
         update_idx: u64,
@@ -79,19 +79,23 @@ impl ChainMonitor {
     }
 
     pub(crate) fn add_tx(&mut self, txid: Txid, channel_info: ChannelInfo) {
-        self.watched_tx.insert(txid, channel_info);
+        log::debug!("Watching transaction {txid}: {channel_info:?}");
+        self.watched_tx.insert(txid, WatchState::new(channel_info));
     }
 
     pub(crate) fn remove_tx(&mut self, txid: &Txid) {
+        log::debug!("Stopped watching transaction {txid}");
         self.watched_tx.remove(txid);
     }
 
     pub(crate) fn cleanup_channel(&mut self, channel_id: ChannelId) {
+        log::debug!("Cleaning up data related to channel {channel_id:?}");
+
         let to_remove = self
             .watched_tx
             .iter()
             .filter_map(|x| {
-                if x.1.channel_id == channel_id {
+                if x.1.channel_id() == channel_id {
                     Some(*x.0)
                 } else {
                     None
@@ -103,37 +107,91 @@ impl ChainMonitor {
         }
     }
 
-    pub(crate) fn process_block(
-        &self,
-        block: &Block,
-        height: u64,
-    ) -> Vec<(Transaction, ChannelInfo)> {
-        let mut res = Vec::new();
-
+    /// Check if any watched transactions are part of the block, confirming them if so.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new block's height is not exactly one more than the last processed height.
+    pub(crate) fn process_block(&mut self, block: &Block, height: u64) {
         assert_eq!(self.last_height + 1, height);
 
-        for tx in &block.txdata {
-            let channel_info = self.watched_tx.get(&tx.txid()).or_else(|| {
-                for txid in tx.input.iter().map(|x| &x.previous_output.txid) {
-                    let info = self.watched_tx.get(txid);
-                    if info.is_some() {
-                        return info;
-                    }
-                }
-                None
-            });
-            if let Some(channel_info) = channel_info {
-                res.push((tx.clone(), channel_info.clone()));
+        for (txid, state) in self.watched_tx.iter_mut() {
+            if let Some(tx) = block.txdata.iter().find(|tx| tx.txid() == *txid) {
+                state.confirm(tx.clone());
             }
         }
 
-        res
+        self.last_height += 1;
     }
 
-    /// To be safe this is a separate function from process block to make sure updates are
-    /// saved before we update the state. It is better to re-process a block than not
-    /// process it at all.
-    pub(crate) fn increment_height(&mut self) {
-        self.last_height += 1;
+    /// All the currently watched transactions which have been confirmed.
+    pub(crate) fn confirmed_txs(&self) -> Vec<(Transaction, ChannelInfo)> {
+        self.watched_tx
+            .iter()
+            .filter_map(|(_, state)| match state {
+                WatchState::Registered { .. } => None,
+                WatchState::Confirmed {
+                    channel_info,
+                    transaction,
+                } => Some((transaction.clone(), *channel_info)),
+            })
+            .collect()
+    }
+}
+
+/// The state of a watched transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WatchState {
+    /// The transaction has been registered but we are not aware of
+    /// any confirmations.
+    Registered { channel_info: ChannelInfo },
+    /// The transaction has received at least one confirmation.
+    Confirmed {
+        channel_info: ChannelInfo,
+        transaction: Transaction,
+    },
+}
+
+impl_dlc_writeable_enum!(
+    WatchState,;
+    (0, Registered, {(channel_info, writeable)}),
+    (1, Confirmed, {(channel_info, writeable), (transaction, writeable)});;
+);
+
+impl WatchState {
+    fn new(channel_info: ChannelInfo) -> Self {
+        Self::Registered { channel_info }
+    }
+
+    fn confirm(&mut self, transaction: Transaction) {
+        match self {
+            WatchState::Registered { ref channel_info } => {
+                log::info!(
+                    "Transaction {} confirmed: {channel_info:?}",
+                    transaction.txid()
+                );
+
+                *self = WatchState::Confirmed {
+                    channel_info: *channel_info,
+                    transaction,
+                }
+            }
+            WatchState::Confirmed {
+                channel_info,
+                transaction,
+            } => {
+                log::warn!(
+                    "Transaction {} already confirmed: {channel_info:?}",
+                    transaction.txid()
+                );
+            }
+        }
+    }
+
+    fn channel_id(&self) -> ChannelId {
+        match self {
+            WatchState::Registered { channel_info }
+            | WatchState::Confirmed { channel_info, .. } => channel_info.channel_id,
+        }
     }
 }

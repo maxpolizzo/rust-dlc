@@ -56,7 +56,8 @@ impl_dlc_writeable!(AcceptedSubChannel, {
     (accept_per_split_point, writeable),
     (split_tx, {cb_writeable, split_tx::write, split_tx::read}),
     (ln_glue_transaction, writeable),
-    (ln_rollback, writeable)
+    (ln_rollback, writeable),
+    (commitment_transactions, vec)
 });
 
 impl_dlc_writeable!(ConfirmedSubChannel, {
@@ -68,7 +69,8 @@ impl_dlc_writeable!(ConfirmedSubChannel, {
     (counter_glue_signature, writeable),
     (ln_rollback, writeable),
     (prev_commitment_secret, writeable),
-    (next_per_commitment_point, writeable)
+    (next_per_commitment_point, writeable),
+    (commitment_transactions, vec)
 });
 
 impl_dlc_writeable!(SignedSubChannel, {

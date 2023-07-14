@@ -84,6 +84,7 @@ impl ChainMonitor {
     }
 
     pub(crate) fn add_tx(&mut self, txid: Txid, channel_info: ChannelInfo) {
+        println!("ADDING: {}", txid);
         self.watched_tx.insert(txid, channel_info);
     }
 

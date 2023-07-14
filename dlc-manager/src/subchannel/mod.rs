@@ -190,6 +190,8 @@ pub struct AcceptedSubChannel {
     pub ln_glue_transaction: Transaction,
     /// Information used to facilitate the rollback of a channel split.
     pub ln_rollback: LnRollBackInfo,
+    /// Commitment transactions to broadcast in order to force close the channel
+    pub commitment_transactions: Vec<bitcoin::Transaction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +249,8 @@ pub struct ConfirmedSubChannel {
     pub next_per_commitment_point: PublicKey,
     /// Information used to facilitate the rollback of a channel split.
     pub ln_rollback: LnRollBackInfo,
+    /// Commitment transactions to broadcast in order to force close the channel
+    pub commitment_transactions: Vec<bitcoin::Transaction>,
 }
 
 impl ConfirmedSubChannel {
@@ -414,6 +418,9 @@ where
         channel_value_satoshis: u64,
         value_to_self_msat: u64,
     );
+
+    ///
+    fn get_latest_holder_commitment_txn(&self, channel_lock: &ChannelLock<SP>) -> Vec<Transaction>;
 }
 
 impl<M: Deref, T: Deref, ES: Deref, NS: Deref, K: Deref, F: Deref, R: Deref, L: Deref>
@@ -504,6 +511,13 @@ where
             channel_value_satoshis,
             value_to_self_msat,
         );
+    }
+
+    fn get_latest_holder_commitment_txn(
+        &self,
+        channel_lock: &ChannelLock<<K::Target as SignerProvider>::Signer>,
+    ) -> Vec<Transaction> {
+        self.get_latest_holder_commitment_txn(channel_lock)
     }
 
     fn with_useable_channel_lock<C, RV>(

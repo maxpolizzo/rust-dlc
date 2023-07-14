@@ -106,6 +106,7 @@ impl ElectrsBlockchainProvider {
 
 impl Blockchain for ElectrsBlockchainProvider {
     fn send_transaction(&self, transaction: &Transaction) -> Result<(), dlc_manager::error::Error> {
+        println!("Sending tx: {}", transaction.txid());
         let res = self
             .client
             .post(format!("{}tx", self.host))

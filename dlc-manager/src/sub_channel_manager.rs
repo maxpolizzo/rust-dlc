@@ -3,7 +3,7 @@
 
 use std::{marker::PhantomData, ops::Deref, sync::Mutex};
 
-use bitcoin::{OutPoint, PackedLockTime, Script, Sequence};
+use bitcoin::{OutPoint, PackedLockTime, Script, Sequence, Transaction};
 use dlc::{
     channel::{get_tx_adaptor_signature, sub_channel::LN_GLUE_TX_WEIGHT},
     PartyParams,
@@ -38,12 +38,12 @@ use crate::{
     chain_monitor::{ChannelInfo, RevokedTxType, TxType},
     channel::{
         generate_temporary_contract_id, offered_channel::OfferedChannel,
-        party_points::PartyBasePoints, Channel,
+        party_points::PartyBasePoints, Channel, ClosedChannel,
     },
     channel_updater::{
         self, FundingInfo, SubChannelSignInfo, SubChannelSignVerifyInfo, SubChannelVerifyInfo,
     },
-    contract::{contract_input::ContractInput, Contract, FundingInputInfo},
+    contract::{contract_input::ContractInput, ClosedContract, Contract, FundingInputInfo},
     error::Error,
     manager::{get_channel_in_state, get_contract_in_state, Manager, CET_NSEQUENCE},
     subchannel::{
@@ -583,6 +583,10 @@ where
                     glue_tx_output_value,
                 );
 
+                let commitment_transactions = self
+                    .ln_channel_manager
+                    .get_latest_holder_commitment_txn(channel_lock);
+
                 let commitment_signed = self
                     .ln_channel_manager
                     .get_updated_funding_outpoint_commitment_signed(
@@ -667,6 +671,7 @@ where
                     split_tx,
                     ln_glue_transaction: ln_glue_tx,
                     ln_rollback: (&channel_details).into(),
+                    commitment_transactions,
                 };
 
                 offered_sub_channel.state = SubChannelState::Accepted(accepted_sub_channel);
@@ -690,84 +695,186 @@ where
 
     /// Start force closing the sub channel with given [`ChannelId`].
     pub fn force_close_sub_channel(&self, channel_id: &ChannelId) -> Result<(), Error> {
-        let (mut signed, state) = get_sub_channel_in_state!(
-            self.dlc_channel_manager,
-            *channel_id,
-            Signed,
-            None::<PublicKey>
-        )?;
-        let counter_party = signed.counter_party;
-        let channel_details = self
-            .ln_channel_manager
-            .get_channel_details(channel_id)
-            .unwrap();
-        self.ln_channel_manager.with_channel_lock_no_check(
-            channel_id,
-            &counter_party,
-            |channel_lock| {
-                let publish_base_secret = self
-                    .dlc_channel_manager
-                    .get_wallet()
-                    .get_secret_key_for_pubkey(&signed.own_base_points.publish_basepoint)?;
+        let sub_channel = self
+            .dlc_channel_manager
+            .get_store()
+            .get_sub_channel(*channel_id)?
+            .ok_or(Error::InvalidParameters(format!(
+                "Unknown sub channel {:?}",
+                channel_id
+            )))?;
 
-                let publish_sk = derive_private_key(
-                    self.dlc_channel_manager.get_secp(),
-                    &state.own_per_split_point,
-                    &publish_base_secret,
+        match sub_channel.state {
+            SubChannelState::Offered(_) => self.force_close_offered_channel(sub_channel)?,
+            SubChannelState::Accepted(ref a) => {
+                let commitment_transactions = a.commitment_transactions.clone();
+
+                println!("IOIO");
+                self.force_close_with_saved_commitment(sub_channel, &commitment_transactions)?;
+            }
+            SubChannelState::Signed(_) | SubChannelState::Finalized(_) => {
+                self.force_close_signed_channel(sub_channel)?
+            }
+            SubChannelState::Confirmed(ref c) => {
+                let commitment_transactions = c.commitment_transactions.clone();
+                self.force_close_with_saved_commitment(sub_channel, &commitment_transactions)?;
+            }
+            SubChannelState::Closing(_) => todo!(),
+            SubChannelState::CloseOffered(_) => todo!(),
+            SubChannelState::CloseAccepted(_) => todo!(),
+            SubChannelState::CloseConfirmed(_) => todo!(),
+            _ => {
+                error!(
+                    "Tried to force close channel with {:?} state",
+                    sub_channel.state
                 );
+                return Err(Error::InvalidParameters(
+                    "Channel is not in a state to be force closed".to_string(),
+                ));
+            }
+        };
 
-                let counter_split_signature = state
-                    .counter_split_adaptor_signature
-                    .decrypt(&publish_sk)
-                    .map_err(|e| APIError::ExternalError { err: e.to_string() })?;
+        Ok(())
+    }
 
-                let mut split_tx = state.split_tx.transaction.clone();
-
-                let mut own_sig = None;
-
-                self.ln_channel_manager
-                    .sign_with_fund_key_cb(channel_lock, &mut |fund_sk| {
-                        own_sig = Some(
-                            dlc::util::get_raw_sig_for_tx_input(
-                                self.dlc_channel_manager.get_secp(),
-                                &split_tx,
-                                0,
-                                &signed.original_funding_redeemscript,
-                                signed.fund_value_satoshis,
-                                fund_sk,
-                            )
-                            .unwrap(),
-                        );
-                        dlc::util::sign_multi_sig_input(
-                            self.dlc_channel_manager.get_secp(),
-                            &mut split_tx,
-                            &counter_split_signature,
-                            &channel_details.counter_funding_pubkey,
-                            fund_sk,
-                            &signed.original_funding_redeemscript,
-                            signed.fund_value_satoshis,
-                            0,
-                        )
-                        .unwrap();
-                    });
-                self.dlc_channel_manager
-                    .get_blockchain()
-                    .send_transaction(&split_tx)?;
-
-                let closing_sub_channel = ClosingSubChannel {
-                    signed_sub_channel: state,
-                    is_initiator: true,
-                };
-
-                signed.state = SubChannelState::Closing(closing_sub_channel);
-
-                self.dlc_channel_manager
-                    .get_store()
-                    .upsert_sub_channel(&signed)?;
-
-                Ok(())
-            },
+    fn force_close_offered_channel(&self, mut sub_channel: SubChannel) -> Result<(), Error> {
+        println!("B");
+        let (closed_channel, closed_contract) = self.get_closed_dlc_channel_and_contract(
+            sub_channel
+                .get_dlc_channel_id(0)
+                .expect("to have a channel id in offered state"),
+            false,
         )?;
+        sub_channel.state = SubChannelState::OnChainClosed;
+        self.ln_channel_manager
+            .force_close_channel(&sub_channel.channel_id, &sub_channel.counter_party)?;
+        self.dlc_channel_manager
+            .get_store()
+            .upsert_sub_channel(&sub_channel)?;
+        self.dlc_channel_manager
+            .get_store()
+            .upsert_channel(closed_channel, Some(closed_contract))?;
+        let mut chain_monitor = self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+        chain_monitor.cleanup_channel(sub_channel.channel_id);
+        self.dlc_channel_manager
+            .get_store()
+            .persist_chain_monitor(&chain_monitor)
+    }
+
+    fn force_close_with_saved_commitment(
+        &self,
+        mut sub_channel: SubChannel,
+        commitment_transactions: &Vec<Transaction>,
+    ) -> Result<(), Error> {
+        for tx in commitment_transactions {
+            self.dlc_channel_manager
+                .get_blockchain()
+                .send_transaction(tx)?;
+        }
+
+        let dlc_channel_id = sub_channel
+            .get_dlc_channel_id(0)
+            .expect("to have a channel id in offered state");
+        println!("A");
+        let (closed_channel, closed_contract) =
+            self.get_closed_dlc_channel_and_contract(dlc_channel_id, false)?;
+        sub_channel.state = SubChannelState::OnChainClosed;
+        self.dlc_channel_manager
+            .get_store()
+            .upsert_channel(closed_channel, Some(closed_contract))?;
+        self.dlc_channel_manager
+            .get_store()
+            .upsert_sub_channel(&sub_channel)?;
+        let mut chain_monitor = self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+        chain_monitor.cleanup_channel(sub_channel.channel_id);
+        chain_monitor.cleanup_channel(dlc_channel_id);
+        self.dlc_channel_manager
+            .get_store()
+            .persist_chain_monitor(&chain_monitor)
+    }
+
+    fn force_close_signed_channel(&self, mut sub_channel: SubChannel) -> Result<(), Error> {
+        if let SubChannelState::Signed(state) | SubChannelState::Finalized(state) =
+            sub_channel.state.clone()
+        {
+            let channel_id = sub_channel.channel_id;
+            let counter_party = sub_channel.counter_party;
+            let channel_details = self
+                .ln_channel_manager
+                .get_channel_details(&channel_id)
+                .unwrap();
+            self.ln_channel_manager.with_channel_lock_no_check(
+                &channel_id,
+                &counter_party,
+                |channel_lock| {
+                    let publish_base_secret = self
+                        .dlc_channel_manager
+                        .get_wallet()
+                        .get_secret_key_for_pubkey(
+                            &sub_channel.own_base_points.publish_basepoint,
+                        )?;
+
+                    let publish_sk = derive_private_key(
+                        self.dlc_channel_manager.get_secp(),
+                        &state.own_per_split_point,
+                        &publish_base_secret,
+                    );
+
+                    let counter_split_signature = state
+                        .counter_split_adaptor_signature
+                        .decrypt(&publish_sk)
+                        .map_err(|e| APIError::ExternalError { err: e.to_string() })?;
+
+                    let mut split_tx = state.split_tx.transaction.clone();
+
+                    let mut own_sig = None;
+
+                    self.ln_channel_manager
+                        .sign_with_fund_key_cb(channel_lock, &mut |fund_sk| {
+                            own_sig = Some(
+                                dlc::util::get_raw_sig_for_tx_input(
+                                    self.dlc_channel_manager.get_secp(),
+                                    &split_tx,
+                                    0,
+                                    &sub_channel.original_funding_redeemscript,
+                                    sub_channel.fund_value_satoshis,
+                                    fund_sk,
+                                )
+                                .unwrap(),
+                            );
+                            dlc::util::sign_multi_sig_input(
+                                self.dlc_channel_manager.get_secp(),
+                                &mut split_tx,
+                                &counter_split_signature,
+                                &channel_details.counter_funding_pubkey,
+                                fund_sk,
+                                &sub_channel.original_funding_redeemscript,
+                                sub_channel.fund_value_satoshis,
+                                0,
+                            )
+                            .unwrap();
+                        });
+                    self.dlc_channel_manager
+                        .get_blockchain()
+                        .send_transaction(&split_tx)?;
+
+                    let closing_sub_channel = ClosingSubChannel {
+                        signed_sub_channel: state,
+                        is_initiator: true,
+                    };
+
+                    sub_channel.state = SubChannelState::Closing(closing_sub_channel);
+
+                    self.dlc_channel_manager
+                        .get_store()
+                        .upsert_sub_channel(&sub_channel)?;
+
+                    Ok(())
+                },
+            )?;
+        } else {
+            unreachable!("Should not call this method if not in Signed state");
+        }
 
         Ok(())
     }
@@ -885,6 +992,7 @@ where
         };
 
         let mut chain_monitor = self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+        println!("CLEANING UP CHANNEL");
         chain_monitor.cleanup_channel(closing.channel_id);
         self.dlc_channel_manager
             .get_store()
@@ -893,6 +1001,73 @@ where
         self.dlc_channel_manager
             .get_store()
             .upsert_sub_channel(&closing)?;
+
+        Ok(())
+    }
+
+    /// Notify that LDK has decided to close the channel with given id.
+    pub fn notify_ln_channel_closed(&self, channel_id: ChannelId) -> Result<(), Error> {
+        let mut sub_channel = self
+            .dlc_channel_manager
+            .get_store()
+            .get_sub_channel(channel_id)?
+            .ok_or(Error::InvalidParameters(format!(
+                "No channel with id {:?} found",
+                channel_id
+            )))?;
+
+        let mut chain_monitor = self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+
+        let (updated_channel, updated_contract) = match sub_channel.state {
+            SubChannelState::Offered(_)
+            | SubChannelState::Accepted(_)
+            | SubChannelState::Confirmed(_)
+            | SubChannelState::Finalized(_) => {
+                let dlc_channel_id = sub_channel
+                    .get_dlc_channel_id(0)
+                    .expect("to have a channel id");
+                let (closed_channel, closed_contract) =
+                    self.get_closed_dlc_channel_and_contract(dlc_channel_id, true)?;
+                sub_channel.state = SubChannelState::CounterOnChainClosed;
+                chain_monitor.cleanup_channel(sub_channel.channel_id);
+                chain_monitor.cleanup_channel(dlc_channel_id);
+                (Some(closed_channel), Some(closed_contract))
+            }
+            SubChannelState::CloseConfirmed(_) | SubChannelState::OffChainClosed => {
+                println!("SETTING TO COUNTER CLOSED");
+                sub_channel.state = SubChannelState::CounterOnChainClosed;
+                (None, None)
+            }
+            SubChannelState::Signed(_) => todo!(),
+            SubChannelState::Closing(_) => {
+                todo!()
+            }
+            SubChannelState::OnChainClosed => (None, None),
+            SubChannelState::CounterOnChainClosed => todo!(),
+            SubChannelState::CloseOffered(_) => todo!(),
+            SubChannelState::CloseAccepted(_) => todo!(),
+            SubChannelState::ClosedPunished(_) => todo!(),
+            SubChannelState::Rejected => {
+                info!("Counterparty closed channel in rejected state, marking as counter closed");
+                sub_channel.state = SubChannelState::CounterOnChainClosed;
+                (None, None)
+            }
+        };
+
+        if let Some(channel) = updated_channel {
+            println!("SAVING CHANNEL");
+            self.dlc_channel_manager
+                .get_store()
+                .upsert_channel(channel, updated_contract)?;
+        }
+
+        self.dlc_channel_manager
+            .get_store()
+            .upsert_sub_channel(&sub_channel)?;
+
+        self.dlc_channel_manager
+            .get_store()
+            .persist_chain_monitor(&chain_monitor)?;
 
         Ok(())
     }
@@ -1397,9 +1572,15 @@ where
             glue_tx_output_value,
         );
 
-        let (split_tx_adaptor_signature, commitment_signed, revoke_and_ack) = self
-            .ln_channel_manager
-            .with_useable_channel_lock(channel_id, counter_party, |channel_lock| {
+        let (
+            split_tx_adaptor_signature,
+            commitment_signed,
+            revoke_and_ack,
+            commitment_transactions,
+        ) = self.ln_channel_manager.with_useable_channel_lock(
+            channel_id,
+            counter_party,
+            |channel_lock| {
                 let mut split_tx_adaptor_signature = None;
                 self.ln_channel_manager
                     .sign_with_fund_key_cb(channel_lock, &mut |sk| {
@@ -1417,6 +1598,10 @@ where
                     });
 
                 let split_tx_adaptor_signature = split_tx_adaptor_signature.unwrap();
+
+                let commitment_transactions = self
+                    .ln_channel_manager
+                    .get_latest_holder_commitment_txn(channel_lock);
 
                 let commitment_signed = self
                     .ln_channel_manager
@@ -1439,8 +1624,10 @@ where
                     split_tx_adaptor_signature,
                     commitment_signed,
                     revoke_and_ack,
+                    commitment_transactions,
                 ))
-            })?;
+            },
+        )?;
 
         let accept_channel = AcceptChannel {
             temporary_channel_id: offered_channel.temporary_channel_id,
@@ -1539,6 +1726,7 @@ where
             prev_commitment_secret: SecretKey::from_slice(&revoke_and_ack.per_commitment_secret)
                 .expect("a valid secret key"),
             next_per_commitment_point: revoke_and_ack.next_per_commitment_point,
+            commitment_transactions,
         };
 
         offered_sub_channel.counter_base_points = Some(accept_points);
@@ -2191,13 +2379,21 @@ where
 
                 sub_channel.state = SubChannelState::OffChainClosed;
 
+                let mut chain_monitor =
+                    self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+                chain_monitor.cleanup_channel(dlc_channel_id);
+
                 self.dlc_channel_manager
                     .get_store()
-                    .upsert_channel(Channel::Signed(dlc_channel), contract)?;
+                    .upsert_channel(dlc_channel, contract)?;
 
                 self.dlc_channel_manager
                     .get_store()
                     .upsert_sub_channel(&sub_channel)?;
+
+                self.dlc_channel_manager
+                    .get_store()
+                    .persist_chain_monitor(&chain_monitor)?;
                 Ok(finalize)
             },
         )?;
@@ -2266,13 +2462,21 @@ where
 
                 sub_channel.state = SubChannelState::OffChainClosed;
 
+                let mut chain_monitor =
+                    self.dlc_channel_manager.get_chain_monitor().lock().unwrap();
+                chain_monitor.cleanup_channel(dlc_channel_id);
+
                 self.dlc_channel_manager
                     .get_store()
-                    .upsert_channel(Channel::Signed(dlc_channel), contract)?;
+                    .upsert_channel(dlc_channel, contract)?;
 
                 self.dlc_channel_manager
                     .get_store()
                     .upsert_sub_channel(&sub_channel)?;
+
+                self.dlc_channel_manager
+                    .get_store()
+                    .persist_chain_monitor(&chain_monitor)?;
                 Ok(())
             },
         )?;
@@ -2428,6 +2632,7 @@ where
             });
 
             for c in closing_sub_channels {
+                println!("HJ");
                 if let Err(e) = self.finalize_force_close_sub_channels(&c.channel_id) {
                     warn!(
                         "Could not finalize force closing of sub channel {:?}: {}",
@@ -2501,11 +2706,12 @@ where
                             continue;
                         }
                         _ => {
-                            log::error!("Unexpected channel state");
+                            log::error!("Unexpected channel state {:?}", sub_channel.state);
                             continue;
                         }
                     };
 
+                    log::info!("Spotted split transaction, marking sub channel as closing");
                     let closing_sub_channel = ClosingSubChannel {
                         signed_sub_channel: state.clone(),
                         is_initiator: false,
@@ -3140,6 +3346,57 @@ where
         }
 
         Ok(())
+    }
+
+    fn get_closed_dlc_channel_and_contract(
+        &self,
+        channel_id: [u8; 32],
+        counter_closed: bool,
+    ) -> Result<(Channel, Contract), Error> {
+        println!("CHANNEL ID: {:?}", channel_id);
+        let channel = self
+            .dlc_channel_manager
+            .get_store()
+            .get_channel(&channel_id)?
+            .ok_or(Error::InvalidParameters(format!(
+                "No such channel {:?}",
+                channel_id
+            )))?;
+        println!("CHANNEL ID: {:?}", channel.get_id());
+        let closed_channel_data = ClosedChannel {
+            counter_party: channel.get_counter_party_id(),
+            temporary_channel_id: channel.get_temporary_id(),
+            channel_id: channel.get_id(),
+        };
+        let closed_channel = if counter_closed {
+            Channel::CounterClosed(closed_channel_data)
+        } else {
+            println!("Setting to closed");
+            Channel::Closed(closed_channel_data)
+        };
+        let contract_id = channel
+            .get_contract_id()
+            .ok_or(Error::InvalidParameters(format!(
+                "Channel {:?} does not have a contract associated",
+                channel_id
+            )))?;
+        let contract = self
+            .dlc_channel_manager
+            .get_store()
+            .get_contract(&contract_id)?
+            .ok_or(Error::InvalidParameters(format!(
+                "No such contract {:?}",
+                contract_id
+            )))?;
+        let closed_contract = Contract::Closed(ClosedContract {
+            attestations: None,
+            signed_cet: None,
+            contract_id,
+            temporary_contract_id: contract.get_id(),
+            counter_party_id: contract.get_counter_party_id(),
+            pnl: 0,
+        });
+        Ok((closed_channel, closed_contract))
     }
 }
 

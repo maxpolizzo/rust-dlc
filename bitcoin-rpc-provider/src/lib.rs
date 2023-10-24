@@ -13,14 +13,15 @@ use bitcoin::{
     Txid,
 };
 use bitcoin::{Address, OutPoint, TxOut};
-use bitcoincore_rpc::{json, Auth, Client, RpcApi};
-use bitcoincore_rpc_json::AddressType;
+use bitcoincore_rpc::{json, jsonrpc::serde_json::Value, Auth, Client, RpcApi};
+use bitcoincore_rpc_json::{AddressType, ListUnspentResultEntry};
 use dlc_manager::error::Error as ManagerError;
 use dlc_manager::{Blockchain, Signer, Utxo, Wallet};
 use json::EstimateMode;
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use log::error;
 use rust_bitcoin_coin_selection::select_coins;
+use simple_wallet::WalletBlockchainProvider;
 
 /// The minimum feerate we are allowed to send, as specify by LDK.
 const MIN_FEERATE: u32 = 253;
@@ -333,14 +334,12 @@ impl Blockchain for BitcoinCoreProvider {
     }
 
     fn get_transaction(&self, tx_id: &Txid) -> Result<Transaction, ManagerError> {
-        let tx_info = self
+        let tx = self
             .client
             .lock()
             .unwrap()
-            .get_transaction(tx_id, None)
+            .get_raw_transaction(tx_id, None)
             .map_err(rpc_err_to_manager_err)?;
-        let tx = Transaction::consensus_decode(&mut tx_info.hex.as_slice())
-            .or(Err(Error::BitcoinError))?;
         Ok(tx)
     }
 
@@ -431,4 +430,68 @@ fn poll_for_fee_estimates(client: Arc<Mutex<Client>>, fees: Arc<HashMap<Target, 
 
         std::thread::sleep(Duration::from_secs(60));
     });
+}
+
+impl WalletBlockchainProvider for BitcoinCoreProvider {
+    fn import_private_key(
+        &self,
+        private_key: &PrivateKey,
+        label: Option<&str>,
+        reason: Option<bool>,
+    ) {
+        self.client
+            .lock()
+            .unwrap()
+            .import_private_key(private_key, label, reason)
+            .expect("Error: import_private_key failed")
+    }
+
+    fn get_utxos_for_address(
+        &self,
+        address: &bitcoin::Address,
+    ) -> Result<Vec<Utxo>, dlc_manager::error::Error> {
+        let utxos: Vec<ListUnspentResultEntry> = self
+            .client
+            .lock()
+            .unwrap()
+            .list_unspent(Some(0), Some(1000000), Some(&[address]), Some(true), None)
+            .unwrap();
+
+        utxos
+            .into_iter()
+            .map(|x| {
+                Ok(Utxo {
+                    address: address.clone(),
+                    outpoint: OutPoint {
+                        txid: x.txid,
+                        vout: x.vout,
+                    },
+                    redeem_script: Script::default(),
+                    reserved: false,
+                    tx_out: TxOut {
+                        value: x.amount.to_sat(),
+                        script_pubkey: address.script_pubkey(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, dlc_manager::error::Error>>()
+    }
+
+    fn is_output_spent(&self, txid: &Txid, vout: u32) -> Result<bool, ManagerError> {
+        let args: &Vec<Value> = &vec![
+            serde_json::Value::String(txid.to_string()),
+            serde_json::Value::Number(serde_json::Number::from(vout)),
+        ];
+
+        let res: bitcoincore_rpc::Result<Value> =
+            self.client.lock().unwrap().call("gettxout", args);
+
+        match res {
+            Ok(data) => match data {
+                Value::Null => Ok(true),
+                _ => Ok(false),
+            },
+            Err(e) => Err(ManagerError::BlockchainError(e.to_string())),
+        }
+    }
 }

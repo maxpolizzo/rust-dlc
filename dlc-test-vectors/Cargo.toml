@@ -1,0 +1,28 @@
+[package]
+authors = ["Atomic Finance"]
+edition = "2018"
+name = "dlc-test-vectors"
+version = "0.1.0"
+
+[dependencies]
+dlc = {version = "0.4.0", path = "../dlc"}
+dlc-trie = {version = "0.4.0", path = "../dlc-trie"}
+dlc-manager = {path = "../dlc-manager"}
+dlc-messages = {path = "../dlc-messages", features = ["use-serde"]}
+bitcoin-rpc-provider = {path = "../bitcoin-rpc-provider"}
+bitcoin-test-utils = {path = "../bitcoin-test-utils"}
+bitcoincore-rpc = {version = "0.16.0"}
+bitcoincore-rpc-json = {version = "0.16.0"}
+secp256k1-zkp = {version = "0.7.0", features = ["bitcoin_hashes", "rand", "rand-std", "global-context", "use-serde"]}
+simple-wallet = {path = "../simple-wallet"}
+mocks = {path = "../mocks"}
+colored = "2.0.4"
+bitcoin = {version = "0.29.2", features = ["serde"]}
+electrs-blockchain-provider = {path = "../electrs-blockchain-provider"}
+lightning = {version = "0.0.113"}
+hex = "0.4.3"
+serde_json = "1.0"
+serde = {version = "1.0", features = ["derive"]}
+
+
+

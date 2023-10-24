@@ -88,7 +88,6 @@ where
 
     let appr_required_amount = own_collateral + get_half_common_fee(fee_rate);
     let utxos = wallet.get_utxos_for_amount(appr_required_amount, Some(fee_rate), true)?;
-
     let mut funding_inputs_info: Vec<FundingInputInfo> = Vec::new();
     let mut funding_tx_info: Vec<TxInputInfo> = Vec::new();
     let mut total_input = 0;

@@ -1,4 +1,4 @@
-use bitcoin::{Block, Transaction, Txid};
+use bitcoin::{Block, PrivateKey, Transaction, Txid};
 use dlc_manager::{error::Error, Blockchain, Utxo};
 use lightning::chain::chaininterface::FeeEstimator;
 use simple_wallet::WalletBlockchainProvider;
@@ -27,6 +27,14 @@ impl Blockchain for MockBlockchain {
 }
 
 impl WalletBlockchainProvider for MockBlockchain {
+    fn import_private_key(
+        &self,
+        _private_key: &PrivateKey,
+        _label: Option<&str>,
+        _reason: Option<bool>,
+    ) {
+        unimplemented!()
+    }
     fn get_utxos_for_address(&self, _address: &bitcoin::Address) -> Result<Vec<Utxo>, Error> {
         unimplemented!()
     }

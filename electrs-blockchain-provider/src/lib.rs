@@ -1,3 +1,5 @@
+extern crate bitcoin;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -7,7 +9,7 @@ use std::time::Duration;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::util::uint::Uint256;
-use bitcoin::{Block, BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, PrivateKey};
 use bitcoin_test_utils::tx_to_string;
 use dlc_manager::{error::Error, Blockchain, Utxo};
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
@@ -165,6 +167,14 @@ impl Blockchain for ElectrsBlockchainProvider {
 }
 
 impl simple_wallet::WalletBlockchainProvider for ElectrsBlockchainProvider {
+    fn import_private_key(
+        &self,
+        _private_key: &PrivateKey,
+        _label: Option<&str>,
+        _reason: Option<bool>,
+    ) {
+        unimplemented!()
+    }
     fn get_utxos_for_address(&self, address: &bitcoin::Address) -> Result<Vec<Utxo>, Error> {
         let utxos: Vec<UtxoResp> = self.get_from_json(&format!("address/{address}/utxo"))?;
 

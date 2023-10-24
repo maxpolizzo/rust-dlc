@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use bitcoin::{
-    Address, Network, PackedLockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    Address, Network, PackedLockTime, PrivateKey, Script, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
 };
 use dlc_manager::{error::Error, Blockchain, Signer, Utxo, Wallet};
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
@@ -12,6 +13,12 @@ type Result<T> = core::result::Result<T, Error>;
 
 /// Trait providing blockchain information to the wallet.
 pub trait WalletBlockchainProvider: Blockchain + FeeEstimator {
+    fn import_private_key(
+        &self,
+        private_key: &PrivateKey,
+        label: Option<&str>,
+        reason: Option<bool>,
+    );
     fn get_utxos_for_address(&self, address: &Address) -> Result<Vec<Utxo>>;
     fn is_output_spent(&self, txid: &Txid, vout: u32) -> Result<bool>;
 }
@@ -61,7 +68,6 @@ where
     /// Refresh the wallet checking and updating the UTXO states.
     pub fn refresh(&self) -> Result<()> {
         let utxos: Vec<Utxo> = self.storage.get_utxos()?;
-
         for utxo in &utxos {
             let is_spent = self
                 .blockchain
@@ -70,19 +76,15 @@ where
                 self.storage.delete_utxo(utxo)?;
             }
         }
-
         let addresses = self.storage.get_addresses()?;
-
         for address in &addresses {
             let utxos = self.blockchain.get_utxos_for_address(address)?;
-
             for utxo in &utxos {
                 if !self.storage.has_utxo(utxo)? {
                     self.storage.upsert_utxo(utxo)?;
                 }
             }
         }
-
         Ok(())
     }
 
@@ -153,6 +155,29 @@ where
         }
 
         self.blockchain.send_transaction(&tx)
+    }
+
+    pub fn import_private_key_for_address(&self, address: &Address) -> Result<()> {
+        // Get secret key from storage
+        match self.storage.get_priv_key_for_address(address).unwrap() {
+            Some(secret_key) => {
+                // Import private key in Bitcoin node (to allow tracking UTXOs)
+                self.blockchain.import_private_key(
+                    &PrivateKey {
+                        compressed: true,
+                        network: Network::Regtest,
+                        inner: secret_key,
+                    },
+                    None,
+                    Some(true),
+                );
+                Ok(())
+            }
+            None => Err(Error::StorageError(
+                "Error: import_address failed, secret key could not be found in storage"
+                    .to_string(),
+            )),
+        }
     }
 }
 
@@ -247,7 +272,7 @@ where
         Ok(selection.into_iter().map(|x| x.utxo).collect::<Vec<_>>())
     }
 
-    fn import_address(&self, _: &Address) -> Result<()> {
+    fn import_address(&self, _address: &Address) -> Result<()> {
         Ok(())
     }
 }
